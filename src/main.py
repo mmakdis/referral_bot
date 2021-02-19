@@ -34,12 +34,14 @@ import string
 import json
 import pprint
 import time
+import math
 import inspect
 from datetime import datetime
 from telegram import Update
 from telegram import MessageEntity
 from telegram import ParseMode
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, error
+from telegram import ReplyKeyboardMarkup
 from telegram.bot import Bot
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
 from telegram.ext import CallbackQueryHandler, MessageHandler, Filters
@@ -48,6 +50,7 @@ from telegram.update import Update
 from configparser import ConfigParser
 from captcha.image import ImageCaptcha
 from tinydb import TinyDB, Query
+from tinydb.operations import delete
 from tinydb.storages import JSONStorage
 from tinydb.middlewares import CachingMiddleware
 from uuid import uuid4
@@ -60,12 +63,12 @@ logging.basicConfig(
 config = ConfigParser()
 
 if not config.read("config.ini"):
-    print("The script couldn't find config.ini. sure it's in the right directory?")
+    print("The script couldn't find config.ini. Sure it's in the right directory?")
     sys.exit(1)
 
 logger = logging.getLogger(__name__)
-#db = TinyDB('../db/db.json', storage=CachingMiddleware(JSONStorage))
-db = TinyDB('../db/db.json')
+db = TinyDB('../db/db.json', storage=CachingMiddleware(JSONStorage))
+#db = TinyDB('../db/db.json')
 User = Query()
 
 def is_digit(digit: str) -> bool:
@@ -150,7 +153,7 @@ def passed_captcha(user_id: int) -> bool:
 
 def has_address(user_id: int) -> bool:
     data = db.get((User.id == user_id) & (User.address.exists()))
-    return True if data else False
+    return True if data and data["address"] else False
 
 def in_channel(context: CallbackContext, user_id: int) -> bool:
     """
@@ -238,17 +241,79 @@ def write(section: str, option: str, value: str):
     except Exception as e:
         print(e)
 
-def calc_top_list(n: int):
-    sorted_db = sorted(db.search((User.captcha == True) & (User.address.exists())),
-                            key=lambda k: k['points'],
-                            reverse=True)
-    filtered_db = []
-    last_points = 0
-    last_date = 0
-    for user_data in sorted_db:
-        if user_data["points"] != last_points:
-            last_points = user_data["points"]
-        
+
+def calc_top_list(n: int) -> dict:
+    """
+    Calculate the top{n}, for an example: top 50 users, top 20 users, whatever.
+    It calculates the points by descending first and then the "first seen" 
+    by ascending. This means that if some users have the same points, whoever
+    joined first is on top (;) 😳)
+
+    returns dict (the same one used in the database)
+    """
+    db_filter = db.search((User.captcha == True) & (User.address.exists()))
+    db_sorted = sorted(db_filter, key=lambda k: (-k['points'], k['first_seen']))    
+    return db_sorted[:n]
+
+def random_n(n):
+    range_start = 10 ** (n - 1)
+    range_end = (10 ** n) - 1
+    return random.randint(range_start, range_end)
+
+def random_address(n):
+    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=n))
+
+def random_username():
+    username = ''.join(random.choices(string.ascii_uppercase + string.ascii_lowercase, k=random.randint(5, 7)))
+    return '@' + username
+
+def fill_db(n: int):
+    """
+    Fill db for testing only (dev!)
+    Use at your own risk.
+    """
+    for i in range(n):
+        new_id = f"{random_n(7)}{i}"
+        db_insertion = {
+            "id": new_id,
+            "first_name": f"User {i}",
+            "captcha": True,
+            "re": False,
+            "referral_link": f"r{random.getrandbits(16)}{new_id}",
+            "address": f"{random_address(40)}{i}",
+            "referred": False,
+            "points": random_n(2),
+            "first_seen": now_ns()
+            }
+        if random.choice([0, 1]): 
+            db_insertion["username"] = random_username()
+        db.insert(db_insertion)
+
+def format_top_list(n, db_sorted: list) -> dict:
+    messages = [f"Top {n} users:\n"]
+    counter = 1
+    for user_data in db_sorted:
+        messages.append(f"<code>{counter})</code> {user_data['first_name']} <i>({user_data['points']} invitations)</i>\n")
+        counter += 1
+    return ''.join(messages)
+
+def admin_top_list(n, db_sorted: list) -> list:
+    # messages = [f"Top {n} users:\n\n"]
+    messages = []
+    counter = 1
+    # https://t.me/{context.bot.get_me().username}?start={referral(user_id)}
+    for user_data in db_sorted:
+        link_message = link(user_data['id'], user_data['first_name'])
+        user_username = f"{' (' + user_data['username'] + ')' if 'username' in user_data else ''}"
+        message = f"""
+        <b>{counter})</b> {link_message}{user_username} (<i>{user_data['points']} points</i>)
+        <i>Addr:</i> <code>{user_data['address']}</code>
+        <i>Referral:</i> <code>{user_data["referral_link"]}</code>
+        """
+        messages.append(inspect.cleandoc(message) + "\n\n")
+        counter += 1
+    # return ''.join(messages)
+    return messages
 
 def check_user(update: Update, context: CallbackContext) -> int:
     """
@@ -278,7 +343,7 @@ def check_user(update: Update, context: CallbackContext) -> int:
                 elif ent.type == MessageEntity.MENTION:
                     from_username = update.message.text[ent.offset:ent.offset + ent.length]
                     from_username = from_username.lower()
-                    if args[0] != from_username:
+                    if args[0].lower() != from_username:
                         update.message.reply_text(text="Usage: /command username/ID", quote=True)
                         return None
                     db_check = db.get(User.username == from_username)
@@ -306,7 +371,51 @@ def users(update: Update, context: CallbackContext) -> None:
     """
     from_id = update.message.from_user.id
     if is_local_admin(from_id):
-        update.message.reply_text(f"Total users: {len(db.all())}")
+        update.message.reply_text(f"Total users: {len(db.all()):,}")
+
+def top_command(update: Update, context: CallbackContext) -> None:
+    from_id = update.message.from_user.id
+    if not context.args:
+        update.message.reply_text("Usage: <code>/top 10</code>\n10 can be replaced by any number",
+                    parse_mode=ParseMode.HTML)
+    elif not is_digit(context.args[0]):
+        update.message.reply_text("Provide a valid number.")
+    elif int(context.args[0]) > 50:
+        update.message.reply_text("Lists more than 50 are not supported.")
+    else:
+        calculation = format_top_list(context.args[0], calc_top_list(int(context.args[0])))
+        update.message.reply_text(calculation, parse_mode=ParseMode.HTML)
+
+def slice_per(lst, n):
+    for i in range(0, len(lst), n):
+        yield lst[i:i + n]
+
+def admin_top_command(update: Update, context: CallbackContext):
+    from_id = update.message.from_user.id
+    if not is_local_admin(from_id):
+        return
+    if not context.args:
+        update.message.reply_text("Usage: <code>/ntop 10</code>\n10 can be replaced by any number",
+                    parse_mode=ParseMode.HTML)
+    elif not is_digit(context.args[0]):
+        update.message.reply_text("Provide a valid number.")
+    elif int(context.args[0]) > 100:
+        update.message.reply_text("Lists more than 100 are not supported yet.")
+    else:
+        # mark
+        top_size = int(context.args[0])
+        calculation = admin_top_list(top_size, calc_top_list(top_size))
+        calc_clean = list(slice_per(calculation, 10))
+        context.user_data["calc"] = calc_clean
+        context.user_data["page"] = 0
+        list_size = math.ceil(len(calculation))
+        keyboard = [[InlineKeyboardButton("⬅️", callback_data=f"admintop_backward:{0}"),
+                    InlineKeyboardButton(f"1/{len(calc_clean)}", callback_data=f"admintop:0"),
+                    InlineKeyboardButton("➡️", callback_data=f"admintop_forward:{0}")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        update.message.reply_text("".join(calc_clean[0]), 
+                            parse_mode=ParseMode.HTML,
+                            reply_markup=reply_markup)
 
 def save(update: Update, context: CallbackContext) -> None:
     """
@@ -340,10 +449,12 @@ def diverter(update: Update, context: CallbackContext) -> None:
     # setchannel_yes:data for the channel:something else maybe?
     args = query.data.split(":")
     if args[0] == "reset_yes":
-        db.update({"points": 0}, User.captcha == True)
-        context.bot.edit_message_text(chat_id=query.message.chat.id, message_id=query.message.message_id, text="Resetted successfully.")
+        if is_local_admin(user_id):
+            db.update({"points": 0}, User.captcha == True)
+            context.bot.edit_message_text(chat_id=query.message.chat.id, message_id=query.message.message_id, text="Resetted successfully.")
     elif args[0] == "reset_no":
-        context.bot.edit_message_text(chat_id=query.message.chat.id, message_id=query.message.message_id, text="Cancelled.")
+        if is_local_admin(user_id):
+            context.bot.edit_message_text(chat_id=query.message.chat.id, message_id=query.message.message_id, text="Cancelled.")
     elif args[0] == "setchannel_yes" and len(args) == 3:
         # to avoid checking the channel name by ID again
         # it just gets passed in the data.
@@ -374,7 +485,6 @@ def diverter(update: Update, context: CallbackContext) -> None:
             if referral:
                 referral_data = referral_valid(referral)
                 referrals = referral_data["referrals"]
-                # mark
                 referrals.append(user_id)
                 referral_id = referral_data["id"]
                 referral_name = referral_data["first_name"]
@@ -389,7 +499,7 @@ def diverter(update: Update, context: CallbackContext) -> None:
                         text=f"Your referral link is: {get_referral_link}")
             else:
                 context.bot.send_message(chat_id=query.message.chat.id,
-                        text=f"Send your ERC-20 USDT address 👇")
+                        text=f"Send your wallet address 👇")
                 context.user_data["get_address"] = True
         else:
             context.bot.answer_callback_query(callback_query_id=query.id, 
@@ -398,6 +508,48 @@ def diverter(update: Update, context: CallbackContext) -> None:
             return
     elif args[0] == "setchannel_no":
         context.bot.edit_message_text(chat_id=query.message.chat.id, message_id=query.message.message_id, text="Cancelled.")
+    elif args[0] == "admintop_forward":
+        calc_data = context.user_data.get("calc", None)
+        calc_page = context.user_data.get("page", None)
+        if not calc_data or calc_page is None:
+            context.bot.answer_callback_query(callback_query_id=query.id)
+            return
+        calc_page += 1
+        if calc_page >= len(calc_data):
+            context.bot.answer_callback_query(callback_query_id=query.id)
+            return
+        message_text = "".join(calc_data[calc_page])
+        keyboard = [[InlineKeyboardButton("⬅️", callback_data=f"admintop_backward:{calc_page}"),
+                    InlineKeyboardButton(f"{calc_page+1}/{len(calc_data)}", callback_data=f"admintop:0"),
+                    InlineKeyboardButton("➡️", callback_data=f"admintop_forward:{calc_page}")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        context.bot.edit_message_text(chat_id=query.message.chat.id, 
+                message_id=query.message.message_id, 
+                text=message_text,
+                reply_markup=reply_markup,
+                parse_mode=ParseMode.HTML)
+        context.user_data["page"] += 1
+    elif args[0] == "admintop_backward":
+        calc_data = context.user_data.get("calc", None)
+        calc_page = context.user_data.get("page", None)
+        if not calc_data or calc_page is None:
+            context.bot.answer_callback_query(callback_query_id=query.id)
+            return
+        calc_page -= 1
+        if calc_page < 0:
+            context.bot.answer_callback_query(callback_query_id=query.id)
+            return
+        message_text = "".join(calc_data[calc_page])
+        keyboard = [[InlineKeyboardButton("⬅️", callback_data=f"admintop_backward:{calc_page}"),
+                    InlineKeyboardButton(f"{calc_page+1}/{len(calc_data)}", callback_data=f"admintop:0"),
+                    InlineKeyboardButton("➡️", callback_data=f"admintop_forward:{calc_page}")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        context.bot.edit_message_text(chat_id=query.message.chat.id, 
+                message_id=query.message.message_id, 
+                text=message_text,
+                reply_markup=reply_markup,
+                parse_mode=ParseMode.HTML)
+        context.user_data["page"] -= 1
     else:
         pass
     context.bot.answer_callback_query(callback_query_id=query.id)
@@ -424,18 +576,22 @@ def user(update: Update, context: CallbackContext) -> None:
     if not db_user_data or not user_data:
         update.message.reply_text("❓ Username unknown (not in db)\nHave you sent /start?")
         return
-    keyboard = [[InlineKeyboardButton("OK", callback_data="ok_cool")]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    reply_keyboard = [['Referral Link', 'Top Referral Chart'],
+                    ['Change Address', 'User']]
+    reply_markup = ReplyKeyboardMarkup(reply_keyboard,
+                one_time_keyboard=True,
+                resize_keyboard=True)
     user_name = user_data["user"]["first_name"]
     message = f"""
     {'⭐️ Admin: ' if is_local_admin(user_id) else '👤 User '} <a href=\"tg://user?id={user_id}\">{user_name}</a> [<code>{user_id}</code>]
     🚀 Points: {db_user_data['points']}
     👀 First seen: {utc_date(utc_ts(db_user_data['first_seen']))} 
-    💳 ERC-20 USDT: {f"<code>{db_user_data['address']}</code>" if 'address' in db_user_data else "not set! send /a"}
+    💳 Wallet address: {f"<code>{db_user_data['address']}</code>" if 'address' in db_user_data else "not set! send /a"}
     🤖 Passed captcha: {'yes' if db_user_data['captcha'] else 'no'}
     """
     update.message.reply_text(text=inspect.cleandoc(message), 
-                        parse_mode=ParseMode.HTML)
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=reply_markup)
 
 def set_channel(update: Update, context: CallbackContext) -> None:
     user_id = update.message.from_user.id
@@ -468,6 +624,27 @@ def get_channel_id(update: Update, context: CallbackContext) -> None:
 
 def channel_commands(update: Update, context: CallbackContext) -> None:
     pass
+
+def invitations(update: Update, context: CallbackContext) -> None:
+    user_id = check_user(update, context)
+    if not user_id:
+        return
+    chat_id = get_local_channels()
+    if not chat_id:
+        update.message.reply_text("Set up a channel first with /setchannel")
+        return
+    user_data = context.bot.get_chat_member(chat_id=chat_id[0], user_id=user_id)
+    db_user_data = db.search(User.id == user_id)
+    user_name = user_data["user"]["first_name"]
+    if len(context.args) != 2:
+        update.message.reply_text("Usage: <code>/p @username 10</code> (10 is an example)")
+        return
+    if is_digit(context.args[1]):
+        db.update({"points": int(context.args[1])}, User.id == user_id)
+        update.message.reply_text(f"Updated <a href=\"tg://user?id={user_id}\">{user_name}</a>'s points from <i>{db_user_data[0]['points']}</i> to <i>{context.args[1]}</i>",
+                            parse_mode=ParseMode.HTML)
+    else:
+        update.message.reply_text("Please provide a number!")
 
 def points(update: Update, context: CallbackContext) -> None:
     user_id = check_user(update, context)
@@ -557,7 +734,7 @@ def start(update: Update, context: CallbackContext) -> None:
             # db.update({"referrals": referrals}, User.referral_link == context.args[0])
             referred = True
             context.user_data["referred_by"] = context.args[0]
-            update.message.reply_text(f"You were sent by {link(referral_id, referral_name)}.",
+            update.message.reply_text(f"You were sent by {referral_name}.",
                             parse_mode=ParseMode.HTML)
         else:
             if referral_data["id"] == from_id:
@@ -578,8 +755,24 @@ def start(update: Update, context: CallbackContext) -> None:
             context.user_data["get_address"] = False
             echo(update, context)
         else:
+            if db_user["first_name"] != from_firstname:
+                db.update({"first_name": from_firstname}, User.id == from_id)
+            if update.message.from_user.username:
+                from_username = update.message.from_user.username.lower()
+                if "username" not in db_user or db_user["username"] != from_username:
+                    db.update({"username": '@' + from_username}, User.id == from_id)
             #todo check if the username and name are changed and update them.
-            update.message.reply_text(f"Your referral link is: {referral_link(context, from_id)}")
+            message_send = config.get("messages", "giveaway_message")
+            message_send += f"\n\n🔗 Your referral link: {referral_link(context, from_id)}"
+            reply_keyboard = [['Referral Link', 'Top Referral Chart'],
+                              ['Change Address', 'User']]
+            reply_markup=ReplyKeyboardMarkup(reply_keyboard, 
+                        one_time_keyboard=True,
+                        resize_keyboard=True)
+            update.message.reply_text(message_send,
+                        reply_markup=reply_markup,
+                        parse_mode=ParseMode.HTML)
+            # update.message.reply_text(f"Your referral link is: {referral_link(context, from_id)}")
     else:
         current_time = now_ns()
         db_insertion = {
@@ -589,6 +782,7 @@ def start(update: Update, context: CallbackContext) -> None:
             "re": False,
             "referred": referred,
             "points": 0,
+            "invitations": 0,
             "first_seen": current_time
             }
         if from_username:
@@ -605,7 +799,7 @@ def help_command(update: Update, context: CallbackContext) -> None:
     if is_local_admin(from_id):
         help_message = """
         <code>/start</code>: start the bot and identify yourself.
-        <code>/address</code> or <code>/a</code>: change your ERC-20 address.
+        <code>/address</code> or <code>/a</code>: change your wallet address.
         <b>[admin|user]</b> <code>/user</code> or <code>/u</code>: check your user data or other user's data.
         <b>[admin]</b> <code>/users</code>: check the total users.
         <b>[admin]</b> <code>/points</code> or <code>p</code>: change a user's points.
@@ -619,7 +813,7 @@ def help_command(update: Update, context: CallbackContext) -> None:
     else:
         help_message = """
         <code>/start</code>: start the bot and identify yourself.
-        <code>/address</code> or <code>/a</code>: change your ERC-20 address.
+        <code>/address</code> or <code>/a</code>: change your wallet address.
         <code>/user</code> or <code>/u</code>: check your user data.
         """
         update.message.reply_text(inspect.cleandoc(help_message), parse_mode=ParseMode.HTML)
@@ -637,6 +831,7 @@ def echo(update: Update, context: CallbackContext) -> None:
     passed = passed_captcha(from_id)
     channel = in_channel(context, from_id)
     address = has_address(from_id)
+    added_address = False
     if not db_user:
         update.message.reply_text("Please send /start first.")
     elif passed:
@@ -655,15 +850,21 @@ def echo(update: Update, context: CallbackContext) -> None:
             referral_data = referral_valid(referral)
             referrals = referral_data["referrals"]
             referrals.append(from_id)
+            referral_points = referral_data["points"]
+            referral_points += 1
+            referral_invitations = referral_data["invitations"]
+            referral_invitations += 1
             referral_id = referral_data["id"]
             referral_name = referral_data["first_name"]
-            db.update({"referrals": referrals}, User.referral_link == referral)
+            db.update({"referrals": referrals,
+                      "invitations": referral_invitations,
+                      "points": referral_points}, User.referral_link == referral)
             context.user_data.pop("referred_by", None)
-            update.message.reply_text(f"Referred by {link(referral_id, referral_name)}",
+            update.message.reply_text(f"Referred by {referral_name}",
                         parse_mode=ParseMode.HTML)
             try:
                 context.bot.send_message(chat_id=referral_data["id"],
-                        text=f"You referred {link(from_id, from_firstname)}.",
+                        text=f"You referred {from_firstname}!",
                         parse_mode=ParseMode.HTML)
             except error.BadRequest:
                 print(f"Tried sending a message to {referral_data['id']} that they referred someone but failed.")
@@ -672,10 +873,11 @@ def echo(update: Update, context: CallbackContext) -> None:
             if value == "Not found":
                 get_address = context.user_data.get("get_address", False)
                 if get_address:
+                    context.user_data["added_address"] = True
                     context.user_data["address"] = update.message.text
                     echo(update, context)
                 else:
-                    update.message.reply_text("Send your ERC-20 USDT address 👇")
+                    update.message.reply_text("Send your wallet address 👇")
                     context.user_data["get_address"] = True
             else:
                 db.update({"address": value}, User.id == from_id)
@@ -685,12 +887,52 @@ def echo(update: Update, context: CallbackContext) -> None:
             #                parse_mode=ParseMode.HTML)
         else:
             # todo: get referral_link
+            # changed username
+            if db_user["first_name"] != from_firstname:
+                db.update({"first_name": from_firstname}, User.id == from_id)
+            if update.message.from_user.username:
+                from_username = update.message.from_user.username.lower()
+                if "username" not in db_user or db_user["username"] != from_username:
+                    db.update({"username": '@' + from_username}, User.id == from_id)
             get_referral_link = referral_link(context, from_id)
-            update.message.reply_text(f"Your referral link is: {get_referral_link}")
+            val_lower = update.message.text.lower()
+            message_send = ""
+            if val_lower == "top referral chart":
+                calculation = format_top_list(50, calc_top_list(50))
+                message_send = calculation
+            elif val_lower == "referral link":
+                message_send = f"Your referral link is: {get_referral_link}"
+            elif val_lower == "change address":
+                #db.update({"address": ""}, User.id == from_id)
+                db.update(delete("address"), User.id == from_id)
+                # echo(update, context)
+                update.message.reply_text("Send your wallet address 👇")
+                context.user_data["get_address"] = True
+                return
+            elif val_lower == "user":
+                user(update, context)
+                return
+            else:
+                if not context.user_data.get("added_address", False):
+                    message_send = config.get("messages", "message")
+                else:
+                    message_send = f"💳 Wallet address set, {from_firstname}.\n\n🔗 Your referral link is: {get_referral_link}"
+                    context.user_data.pop("added_address")
+            reply_keyboard = [['Referral Link', 'Top Referral Chart'],
+                              ['Change Address', 'User']]
+            reply_markup=ReplyKeyboardMarkup(reply_keyboard, 
+                        one_time_keyboard=True,
+                        resize_keyboard=True)
+            update.message.reply_text(message_send,
+                        reply_markup=reply_markup,
+                        parse_mode=ParseMode.HTML)
     else:
         value = context.user_data.get("captcha_text", 'Not found')
+        text_val = update.message.text
+        letters = "COPSUVWXZ"
+        text = text_val.translate({ord(x): y for (x, y) in zip(letters, letters.lower())})
         # todo add the pop function here
-        if update.message.text == value:
+        if text == value:
             db.update({"captcha": True, "re": False}, User.id == from_id)
             context.user_data.pop("captcha_text", None)   
             echo(update, context)
@@ -715,12 +957,16 @@ def channel_chat(update: Update, context: CallbackContext) -> None:
 def new_status(update: Update, context: CallbackContext) -> None:
     print("status")
 
+def custom_sig(signal_number, frame):
+    sig_name = signal.Signals(signal_number).name
+    logger.info(f'Captured signal number {signal_number}. Name: {sig_name}')
+
 def main():
     """
     Start the bot and add the commands.
     """
     # Create the Updater and pass it your bot's token.
-    updater = Updater(config.get("main", "token"))
+    updater = Updater(config.get("main", "token"), user_sig_handler=custom_sig)
 
     # Get the dispatcher to register handlers
     dispatcher = updater.dispatcher
@@ -732,6 +978,8 @@ def main():
     dispatcher.add_handler(CommandHandler("save", save))
     dispatcher.add_handler(CommandHandler(["help", "h"], help_command, Filters.chat_type.private))
     dispatcher.add_handler(CommandHandler("users", users))
+    dispatcher.add_handler(CommandHandler(["top", "t"], top_command))
+    dispatcher.add_handler(CommandHandler(["ntop", "nt"], admin_top_command))
     dispatcher.add_handler(CommandHandler(["user", "u"], user, Filters.chat_type.private))
     dispatcher.add_handler(CommandHandler(["points", "p"], points, Filters.chat_type.private))
     dispatcher.add_handler(CommandHandler(["address", "a"], address, Filters.chat_type.private))
@@ -757,7 +1005,7 @@ def main():
     # SIGTERM or SIGABRT. This should be used most of the time, since
     # start_polling() is non-blocking and will stop the bot gracefully.
     updater.idle()
-
+    logger.info('Bot stopped.')
 
 if __name__ == '__main__':
     main()
