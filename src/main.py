@@ -67,7 +67,7 @@ if not config.read("config.ini"):
     sys.exit(1)
 
 logger = logging.getLogger(__name__)
-db = TinyDB('../db/db.json', storage=CachingMiddleware(JSONStorage))
+db = TinyDB('../db/db.db', storage=CachingMiddleware(JSONStorage))
 #db = TinyDB('../db/db.json')
 User = Query()
 
@@ -135,11 +135,13 @@ def is_local_channel(channel_id: int) -> bool:
     return channel_id in get_local_channels()
 
 def get_local_admins() -> list:
-    data: list = config.get("admin", "admins").split(",")
+    data: list = [admin_id.strip() for admin_id 
+                  in config.get("admin", "admins").split(",")]
     return [int(user_id) for user_id in data if is_digit(user_id)]
 
 def get_local_channels() -> list:
-    data = config.get("chats", "channels").split(",")
+    data = [channel_id.strip() for channel_id 
+            in config.get("chats", "channels").split(",")]
     return [int(channel) for channel in data if is_digit(channel)]
 
 def passed_captcha(user_id: int) -> bool:
@@ -240,7 +242,6 @@ def write(section: str, option: str, value: str):
             config.write(configfile)
     except Exception as e:
         print(e)
-
 
 def calc_top_list(n: int) -> dict:
     """
@@ -422,8 +423,15 @@ def save(update: Update, context: CallbackContext) -> None:
     Placeholder until otherwise.
     """
     from_id = update.message.from_user.id
-    if is_local_admin(from_id):
+    if not is_local_admin(from_id):
         pass
+    try:
+        db.storage.flush()
+        update.message.reply_text("Successfully flushed cashed data.")
+    except Exception as e:
+        update.message.reply_text("Error occured. Closing DB, rerun the bot.")
+        # db.storage.close()
+        db.close()
 
 def test(update: Update, context: CallbackContext) -> None:
     # testing function
@@ -583,7 +591,7 @@ def user(update: Update, context: CallbackContext) -> None:
                 resize_keyboard=True)
     user_name = user_data["user"]["first_name"]
     message = f"""
-    {'⭐️ Admin: ' if is_local_admin(user_id) else '👤 User '} <a href=\"tg://user?id={user_id}\">{user_name}</a> [<code>{user_id}</code>]
+    {'⭐️ Admin: ' if is_local_admin(user_id) else '👤 User: '} <a href=\"tg://user?id={user_id}\">{user_name}</a> [<code>{user_id}</code>]
     🚀 Points: {db_user_data['points']}
     👀 First seen: {utc_date(utc_ts(db_user_data['first_seen']))} 
     💳 Wallet address: {f"<code>{db_user_data['address']}</code>" if 'address' in db_user_data else "not set! send /a"}
@@ -685,6 +693,14 @@ def address(update: Update, context: CallbackContext) -> None:
         update.message.reply_text(message, parse_mode=ParseMode.HTML)
     else:
         update.message.reply_text("Please send /start first")
+
+def reload_command(update: Update, context: CallbackContext):
+    from_id = update.message.from_user.id
+    if not is_local_admin(from_id):
+        return
+    else:
+        config.read("config.ini")
+        update.message.reply_text("Reloaded `config.ini`", parse_mode=ParseMode.MARKDOWN)
 
 def reset(update: Update, context: CallbackContext) -> None:
     user_id = update.message.from_user.id
@@ -802,6 +818,8 @@ def help_command(update: Update, context: CallbackContext) -> None:
         <code>/address</code> or <code>/a</code>: change your wallet address.
         <b>[admin|user]</b> <code>/user</code> or <code>/u</code>: check your user data or other user's data.
         <b>[admin]</b> <code>/users</code>: check the total users.
+        <b>[admin]</b> <code>/reload</code>: reload <code>config.ini</code>.
+        <b>[admin]</b> <code>/save</code>: flush cashed data into DB.
         <b>[admin]</b> <code>/points</code> or <code>p</code>: change a user's points.
         <b>[admin]</b> <code>/reset</code> or <code>r</code>: reset all users' points.
         <b>[admin]</b> <code>/setchannel</code> or <code>sc</code>: set a channel as the main channel.
@@ -983,6 +1001,7 @@ def main():
     dispatcher.add_handler(CommandHandler(["user", "u"], user, Filters.chat_type.private))
     dispatcher.add_handler(CommandHandler(["points", "p"], points, Filters.chat_type.private))
     dispatcher.add_handler(CommandHandler(["address", "a"], address, Filters.chat_type.private))
+    dispatcher.add_handler(CommandHandler(["reload"], reload_command, Filters.chat_type.private))
     dispatcher.add_handler(CommandHandler(["setchannel", "sc"], set_channel, Filters.chat_type.private))
     dispatcher.add_handler(CommandHandler(["test"], test))
 
