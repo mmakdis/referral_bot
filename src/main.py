@@ -36,6 +36,8 @@ import pprint
 import time
 import math
 import inspect
+import atexit
+import signal
 from datetime import datetime
 from telegram import Update
 from telegram import MessageEntity
@@ -54,6 +56,7 @@ from tinydb.operations import delete
 from tinydb.storages import JSONStorage
 from tinydb.middlewares import CachingMiddleware
 from uuid import uuid4
+import data
 
 # Enable logging
 logging.basicConfig(
@@ -290,7 +293,7 @@ def fill_db(n: int):
             db_insertion["username"] = random_username()
         db.insert(db_insertion)
 
-def format_top_list(n, db_sorted: list) -> dict:
+def format_top_list(n, db_sorted: list) -> str:
     messages = [f"Top {n} users:\n"]
     counter = 1
     for user_data in db_sorted:
@@ -304,10 +307,11 @@ def admin_top_list(n, db_sorted: list) -> list:
     counter = 1
     # https://t.me/{context.bot.get_me().username}?start={referral(user_id)}
     for user_data in db_sorted:
-        link_message = link(user_data['id'], user_data['first_name'])
-        user_username = f"{' (' + user_data['username'] + ')' if 'username' in user_data else ''}"
+        user_id = user_data['id']
+        link_message = link(user_id, user_data['first_name'])
+        # user_username = f"{' (' + user_data['username'] + ')' if 'username' in user_data else ''}"
         message = f"""
-        <b>{counter})</b> {link_message}{user_username} (<i>{user_data['points']} points</i>)
+        <b>{counter})</b> {link_message} [<code>{user_id}</code>] (<i>{user_data['points']} points</i>)
         <i>Addr:</i> <code>{user_data['address']}</code>
         <i>Referral:</i> <code>{user_data["referral_link"]}</code>
         """
@@ -384,7 +388,9 @@ def top_command(update: Update, context: CallbackContext) -> None:
     elif int(context.args[0]) > 50:
         update.message.reply_text("Lists more than 50 are not supported.")
     else:
-        calculation = format_top_list(context.args[0], calc_top_list(int(context.args[0])))
+        #top_l = int(config.get("main", "top_chart"))
+        calculation = data.current_calc 
+        #calculation = format_top_list(top_l, calc_top_list(top_l))
         update.message.reply_text(calculation, parse_mode=ParseMode.HTML)
 
 def slice_per(lst, n):
@@ -451,6 +457,7 @@ def diverter(update: Update, context: CallbackContext) -> None:
     """
     query = update.callback_query
     user_id = query.from_user.id
+    user_firstname = query.from_user.first_name
     if query is None or not is_local_admin(user_id):
         pass
     # data comes in like
@@ -496,18 +503,27 @@ def diverter(update: Update, context: CallbackContext) -> None:
                 referrals.append(user_id)
                 referral_id = referral_data["id"]
                 referral_name = referral_data["first_name"]
-                db.update({"referrals": referrals}, User.referral_link == referral)
-                context.user_data.pop("referred_by", None)
+                db.update({"referrals": referrals,
+                      "invitations": referral_data["invitations"] + 1,
+                      "points": referral_data["points"] + 1}, User.referral_link == referral)
+                context.user_data.pop("referred_by")
                 context.bot.send_message(chat_id=query.message.chat.id,
-                            text=f"Referred by {link(referral_id, referral_name)}",
+                            text=f"Referred by {referral_name}, send /start",
                             parse_mode=ParseMode.HTML)
+                try:
+                    context.bot.send_message(chat_id=referral_data["id"],
+                            text=f"You referred {user_firstname}!",
+                            parse_mode=ParseMode.HTML)
+                except error.BadRequest:
+                    print(f"Tried sending a message to {referral_data['id']} that they referred someone but failed.")
             if has_address(user_id):
                 get_referral_link = referral_link(context, user_id)
                 context.bot.send_message(chat_id=query.message.chat.id,
-                        text=f"Your referral link is: {get_referral_link}")
+                        text=f"Your referral link is: {get_referral_link}\n\nYour ID: <code>{user_id}</code>",
+                        parse_mode=ParseMode.HTML)
             else:
                 context.bot.send_message(chat_id=query.message.chat.id,
-                        text=f"Send your wallet address 👇")
+                        text=f"Send your ERC-20 USDT address 👇")
                 context.user_data["get_address"] = True
         else:
             context.bot.answer_callback_query(callback_query_id=query.id, 
@@ -594,7 +610,7 @@ def user(update: Update, context: CallbackContext) -> None:
     {'⭐️ Admin: ' if is_local_admin(user_id) else '👤 User: '} <a href=\"tg://user?id={user_id}\">{user_name}</a> [<code>{user_id}</code>]
     🚀 Points: {db_user_data['points']}
     👀 First seen: {utc_date(utc_ts(db_user_data['first_seen']))} 
-    💳 Wallet address: {f"<code>{db_user_data['address']}</code>" if 'address' in db_user_data else "not set! send /a"}
+    💳 ERC-20 USDT address: {f"<code>{db_user_data['address']}</code>" if 'address' in db_user_data else "not set! send /a"}
     🤖 Passed captcha: {'yes' if db_user_data['captcha'] else 'no'}
     """
     update.message.reply_text(text=inspect.cleandoc(message), 
@@ -675,6 +691,20 @@ def points(update: Update, context: CallbackContext) -> None:
     else:
         update.message.reply_text("Please provide a number!")
 
+def who_command(update: Update, context: CallbackContext) -> None:
+    from_id = check_user(update, context)
+    if not from_id: return
+    user_data = db.get(User.id == from_id)
+    message = []
+    messages = [f"{user_data['first_name']} has referred {user_data['points']} users.\n"]
+    counter = 1
+    for referral in user_data['referrals']:
+        referral_data = db.get(User.id == referral)
+        if not referral_data: continue
+        messages.append(f"<code>{counter})</code> {link(referral_data['id'], referral_data['first_name'])} <i>({referral_data['points']} invitations)</i> [<code>{referral_data['id']}</code>]\n")
+        counter += 1
+    update.message.reply_text(''.join(messages), parse_mode=ParseMode.HTML)
+
 def address(update: Update, context: CallbackContext) -> None:
     #user_id = check_user(update, context)
     from_id = update.message.from_user.id    
@@ -742,10 +772,10 @@ def start(update: Update, context: CallbackContext) -> None:
             update.message.reply_text("The referral link is invalid or does not exist.")
             return
         if not db_user:
-            # referral_data = db.get(User.referral_link == context.args[0])
-            referrals = referral_data["referrals"]
-            referrals.append(from_id)
-            referral_id = referral_data["id"]
+            referral_data = db.get(User.referral_link == context.args[0])
+            #referrals = referral_data["referrals"]
+            #referrals.append(from_id)
+            #referral_id = referral_data["id"]
             referral_name = referral_data["first_name"]
             # db.update({"referrals": referrals}, User.referral_link == context.args[0])
             referred = True
@@ -779,7 +809,7 @@ def start(update: Update, context: CallbackContext) -> None:
                     db.update({"username": '@' + from_username}, User.id == from_id)
             #todo check if the username and name are changed and update them.
             message_send = config.get("messages", "giveaway_message")
-            message_send += f"\n\n🔗 Your referral link: {referral_link(context, from_id)}"
+            message_send += f"\n\n🔗 Your referral link: {referral_link(context, from_id)}\n\nYour ID: <code>{from_id}</code>"
             reply_keyboard = [['Referral Link', 'Top Referral Chart'],
                               ['Change Address', 'User']]
             reply_markup=ReplyKeyboardMarkup(reply_keyboard, 
@@ -815,7 +845,7 @@ def help_command(update: Update, context: CallbackContext) -> None:
     if is_local_admin(from_id):
         help_message = """
         <code>/start</code>: start the bot and identify yourself.
-        <code>/address</code> or <code>/a</code>: change your wallet address.
+        <code>/address</code> or <code>/a</code>: change your ERC-20 USDT address.
         <b>[admin|user]</b> <code>/user</code> or <code>/u</code>: check your user data or other user's data.
         <b>[admin]</b> <code>/users</code>: check the total users.
         <b>[admin]</b> <code>/reload</code>: reload <code>config.ini</code>.
@@ -831,7 +861,7 @@ def help_command(update: Update, context: CallbackContext) -> None:
     else:
         help_message = """
         <code>/start</code>: start the bot and identify yourself.
-        <code>/address</code> or <code>/a</code>: change your wallet address.
+        <code>/address</code> or <code>/a</code>: change your ERC-20 USDT address.
         <code>/user</code> or <code>/u</code>: check your user data.
         """
         update.message.reply_text(inspect.cleandoc(help_message), parse_mode=ParseMode.HTML)
@@ -867,18 +897,16 @@ def echo(update: Update, context: CallbackContext) -> None:
         if referral:
             referral_data = referral_valid(referral)
             referrals = referral_data["referrals"]
+            if from_id in referrals:
+                return
             referrals.append(from_id)
-            referral_points = referral_data["points"]
-            referral_points += 1
-            referral_invitations = referral_data["invitations"]
-            referral_invitations += 1
             referral_id = referral_data["id"]
             referral_name = referral_data["first_name"]
             db.update({"referrals": referrals,
-                      "invitations": referral_invitations,
-                      "points": referral_points}, User.referral_link == referral)
-            context.user_data.pop("referred_by", None)
-            update.message.reply_text(f"Referred by {referral_name}",
+                      "invitations": referral_data["invitations"] + 1,
+                      "points": referral_data["points"] + 1}, User.referral_link == referral)
+            context.user_data.pop("referred_by")
+            update.message.reply_text(f"Referred by {referral_name}, send /start",
                         parse_mode=ParseMode.HTML)
             try:
                 context.bot.send_message(chat_id=referral_data["id"],
@@ -895,7 +923,7 @@ def echo(update: Update, context: CallbackContext) -> None:
                     context.user_data["address"] = update.message.text
                     echo(update, context)
                 else:
-                    update.message.reply_text("Send your wallet address 👇")
+                    update.message.reply_text("Send your ERC-20 USDT address 👇")
                     context.user_data["get_address"] = True
             else:
                 db.update({"address": value}, User.id == from_id)
@@ -916,15 +944,15 @@ def echo(update: Update, context: CallbackContext) -> None:
             val_lower = update.message.text.lower()
             message_send = ""
             if val_lower == "top referral chart":
-                calculation = format_top_list(50, calc_top_list(50))
-                message_send = calculation
+                #calculation = format_top_list(top_l, calc_top_list(top_l))
+                message_send = data.current_calc 
             elif val_lower == "referral link":
-                message_send = f"Your referral link is: {get_referral_link}"
+                message_send = f"Your referral link is: {get_referral_link}\n\nYour ID: <code>{from_id}</code>"
             elif val_lower == "change address":
                 #db.update({"address": ""}, User.id == from_id)
                 db.update(delete("address"), User.id == from_id)
                 # echo(update, context)
-                update.message.reply_text("Send your wallet address 👇")
+                update.message.reply_text("Send your ERC-20 USDT address 👇")
                 context.user_data["get_address"] = True
                 return
             elif val_lower == "user":
@@ -934,7 +962,7 @@ def echo(update: Update, context: CallbackContext) -> None:
                 if not context.user_data.get("added_address", False):
                     message_send = config.get("messages", "message")
                 else:
-                    message_send = f"💳 Wallet address set, {from_firstname}.\n\n🔗 Your referral link is: {get_referral_link}"
+                    message_send = f"💳 ERC-20 USDT address set, {from_firstname}.\n\n🔗 Your referral link is: {get_referral_link}\n\nYour ID: <code>{from_id}</code>"
                     context.user_data.pop("added_address")
             reply_keyboard = [['Referral Link', 'Top Referral Chart'],
                               ['Change Address', 'User']]
@@ -967,24 +995,39 @@ def echo(update: Update, context: CallbackContext) -> None:
             start(update, context)
 
 def channel_chat(update: Update, context: CallbackContext) -> None:
-    #print(update.channel_post.chat.type)
-    pass
-    #print(update)
-    # print(update.message.chat.type)
+    logger.info("Saving the database...")
+    try:
+        db.storage.flush()
+    except Exception as e:
+        db.close()
+    logger.info("Done")
 
 def new_status(update: Update, context: CallbackContext) -> None:
     print("status")
 
-def custom_sig(signal_number, frame):
-    sig_name = signal.Signals(signal_number).name
-    logger.info(f'Captured signal number {signal_number}. Name: {sig_name}')
+#@atexit.register
+def release_db(sig, name):
+    logger.info("Saving the database...")
+    try:
+        db.storage.flush()
+    except Exception as e:
+        db.close()
+    logger.info("Done")
+
+def sig_handler():
+    sys.exit(0)
+
+def update_leaderboard(bot):
+    top_l = int(config.get("main", "top_chart"))
+    calculation = format_top_list(top_l, calc_top_list(top_l))
+    data.current_calc = calculation
 
 def main():
     """
     Start the bot and add the commands.
     """
     # Create the Updater and pass it your bot's token.
-    updater = Updater(config.get("main", "token"), user_sig_handler=custom_sig)
+    updater = Updater(config.get("main", "token"), user_sig_handler=release_db)
 
     # Get the dispatcher to register handlers
     dispatcher = updater.dispatcher
@@ -996,10 +1039,12 @@ def main():
     dispatcher.add_handler(CommandHandler("save", save))
     dispatcher.add_handler(CommandHandler(["help", "h"], help_command, Filters.chat_type.private))
     dispatcher.add_handler(CommandHandler("users", users))
-    dispatcher.add_handler(CommandHandler(["top", "t"], top_command))
+    # User top command
+    # dispatcher.add_handler(CommandHandler(["top", "t"], top_command))
     dispatcher.add_handler(CommandHandler(["ntop", "nt"], admin_top_command))
     dispatcher.add_handler(CommandHandler(["user", "u"], user, Filters.chat_type.private))
     dispatcher.add_handler(CommandHandler(["points", "p"], points, Filters.chat_type.private))
+    dispatcher.add_handler(CommandHandler(["who", "w"], who_command, Filters.chat_type.private))
     dispatcher.add_handler(CommandHandler(["address", "a"], address, Filters.chat_type.private))
     dispatcher.add_handler(CommandHandler(["reload"], reload_command, Filters.chat_type.private))
     dispatcher.add_handler(CommandHandler(["setchannel", "sc"], set_channel, Filters.chat_type.private))
@@ -1016,6 +1061,12 @@ def main():
     dispatcher.add_handler(MessageHandler(Filters.status_update.new_chat_members & Filters.chat_type, new_status))
     # Callback query handler.
     dispatcher.add_handler(CallbackQueryHandler(diverter))
+    
+    jobs = dispatcher.job_queue
+    jobs.run_repeating(
+        update_leaderboard,
+        interval=int(config.get("main", "update_leaderboard_every")),
+        first=1)
 
     # Start the Bot
     updater.start_polling()
@@ -1023,8 +1074,9 @@ def main():
     # Run the bot until you press Ctrl-C or the process receives SIGINT,
     # SIGTERM or SIGABRT. This should be used most of the time, since
     # start_polling() is non-blocking and will stop the bot gracefully.
+    #atexit.register(release_db, updater)
+    #signal.signal(signal.SIGTERM, sig_handler)
     updater.idle()
-    logger.info('Bot stopped.')
 
 if __name__ == '__main__':
     main()
