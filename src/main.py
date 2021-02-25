@@ -35,6 +35,7 @@ import json
 import pprint
 import time
 import math
+import html
 import inspect
 import atexit
 import signal
@@ -297,7 +298,7 @@ def format_top_list(n, db_sorted: list) -> str:
     messages = [f"Top {n} users:\n"]
     counter = 1
     for user_data in db_sorted:
-        messages.append(f"<code>{counter})</code> {user_data['first_name']} <i>({user_data['points']} invitations)</i>\n")
+        messages.append(f"<code>{counter})</code> {html.escape(user_data['first_name'])} <i>({user_data['points']} invitations)</i>\n")
         counter += 1
     return ''.join(messages)
 
@@ -308,7 +309,7 @@ def admin_top_list(n, db_sorted: list) -> list:
     # https://t.me/{context.bot.get_me().username}?start={referral(user_id)}
     for user_data in db_sorted:
         user_id = user_data['id']
-        link_message = link(user_id, user_data['first_name'])
+        link_message = link(user_id, html.escape(user_data['first_name']))
         # user_username = f"{' (' + user_data['username'] + ')' if 'username' in user_data else ''}"
         message = f"""
         <b>{counter})</b> {link_message} [<code>{user_id}</code>] (<i>{user_data['points']} points</i>)
@@ -508,11 +509,11 @@ def diverter(update: Update, context: CallbackContext) -> None:
                       "points": referral_data["points"] + 1}, User.referral_link == referral)
                 context.user_data.pop("referred_by")
                 context.bot.send_message(chat_id=query.message.chat.id,
-                            text=f"Referred by {referral_name}, send /start",
+                            text=f"Referred by {html.escape(referral_name)}, send /start",
                             parse_mode=ParseMode.HTML)
                 try:
                     context.bot.send_message(chat_id=referral_data["id"],
-                            text=f"You referred {user_firstname}!",
+                            text=f"You referred {html.escape(user_firstname)}!",
                             parse_mode=ParseMode.HTML)
                 except error.BadRequest:
                     print(f"Tried sending a message to {referral_data['id']} that they referred someone but failed.")
@@ -606,6 +607,7 @@ def user(update: Update, context: CallbackContext) -> None:
                 one_time_keyboard=True,
                 resize_keyboard=True)
     user_name = user_data["user"]["first_name"]
+    user_name = html.escape(user_name)
     message = f"""
     {'⭐️ Admin: ' if is_local_admin(user_id) else '👤 User: '} <a href=\"tg://user?id={user_id}\">{user_name}</a> [<code>{user_id}</code>]
     🚀 Points: {db_user_data['points']}
@@ -660,6 +662,7 @@ def invitations(update: Update, context: CallbackContext) -> None:
     user_data = context.bot.get_chat_member(chat_id=chat_id[0], user_id=user_id)
     db_user_data = db.search(User.id == user_id)
     user_name = user_data["user"]["first_name"]
+    user_name = html.escape(user_name)
     if len(context.args) != 2:
         update.message.reply_text("Usage: <code>/p @username 10</code> (10 is an example)")
         return
@@ -681,6 +684,7 @@ def points(update: Update, context: CallbackContext) -> None:
     user_data = context.bot.get_chat_member(chat_id=chat_id[0], user_id=user_id)
     db_user_data = db.search(User.id == user_id)
     user_name = user_data["user"]["first_name"]
+    user_name = html.escape(user_name)
     if len(context.args) != 2:
         update.message.reply_text("Usage: <code>/p @username 10</code> (10 is an example)")
         return
@@ -696,12 +700,12 @@ def who_command(update: Update, context: CallbackContext) -> None:
     if not from_id: return
     user_data = db.get(User.id == from_id)
     message = []
-    messages = [f"{user_data['first_name']} has referred {user_data['points']} users.\n"]
+    messages = [f"{html.escape(user_data['first_name'])} has referred {user_data['points']} users.\n"]
     counter = 1
     for referral in user_data['referrals']:
         referral_data = db.get(User.id == referral)
         if not referral_data: continue
-        messages.append(f"<code>{counter})</code> {link(referral_data['id'], referral_data['first_name'])} <i>({referral_data['points']} invitations)</i> [<code>{referral_data['id']}</code>]\n")
+        messages.append(f"<code>{counter})</code> {link(referral_data['id'], html.escape(referral_data['first_name']))} <i>({referral_data['points']} invitations)</i> [<code>{referral_data['id']}</code>]\n")
         counter += 1
     update.message.reply_text(''.join(messages), parse_mode=ParseMode.HTML)
 
@@ -777,6 +781,7 @@ def start(update: Update, context: CallbackContext) -> None:
             #referrals.append(from_id)
             #referral_id = referral_data["id"]
             referral_name = referral_data["first_name"]
+            referral_name = html.escape(referral_name)
             # db.update({"referrals": referrals}, User.referral_link == context.args[0])
             referred = True
             context.user_data["referred_by"] = context.args[0]
@@ -906,11 +911,11 @@ def echo(update: Update, context: CallbackContext) -> None:
                       "invitations": referral_data["invitations"] + 1,
                       "points": referral_data["points"] + 1}, User.referral_link == referral)
             context.user_data.pop("referred_by")
-            update.message.reply_text(f"Referred by {referral_name}, send /start",
+            update.message.reply_text(f"Referred by {html.escape(referral_name)}, send /start",
                         parse_mode=ParseMode.HTML)
             try:
                 context.bot.send_message(chat_id=referral_data["id"],
-                        text=f"You referred {from_firstname}!",
+                        text=f"You referred {html.escape(from_firstname)}!",
                         parse_mode=ParseMode.HTML)
             except error.BadRequest:
                 print(f"Tried sending a message to {referral_data['id']} that they referred someone but failed.")
