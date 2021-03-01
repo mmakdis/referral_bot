@@ -45,7 +45,8 @@ from telegram import MessageEntity
 from telegram import ParseMode
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, error
 from telegram import ReplyKeyboardMarkup
-from telegram.bot import Bot
+from telegram.bot import Bot, Request
+from telegram.ext import messagequeue as mq
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
 from telegram.ext import CallbackQueryHandler, MessageHandler, Filters
 from telegram.message import Message
@@ -294,6 +295,11 @@ def fill_db(n: int):
             db_insertion["username"] = random_username()
         db.insert(db_insertion)
 
+def fill_db_user(user_id):
+    all_ids = [user_id['id'] for user_id in db.search(User.captcha == True)]
+    db.update({"referrals": all_ids}, User.id == user_id)
+    db.storage.flush()
+
 def format_top_list(n, db_sorted: list) -> str:
     messages = [f"Top {n} users:\n"]
     counter = 1
@@ -440,13 +446,36 @@ def save(update: Update, context: CallbackContext) -> None:
         # db.storage.close()
         db.close()
 
+class MQBot(Bot):
+    '''A subclass of Bot which delegates send method handling to MQ'''
+    def __init__(self, *args, is_queued_def=True, mqueue=None, **kwargs):
+        super(MQBot, self).__init__(*args, **kwargs)
+        # below 2 attributes should be provided for decorator usage
+        self._is_messages_queued_default = is_queued_def
+        self._msg_queue = mqueue or mq.MessageQueue()
+
+    def __del__(self):
+        try:
+            self._msg_queue.stop()
+        except:
+            pass
+
+    @mq.queuedmessage
+    def send_message(self, *args, **kwargs):
+        '''Wrapped method would accept new `queued` and `isgroup`
+        OPTIONAL arguments'''
+        return super(MQBot, self).send_message(*args, **kwargs)
+
 def test(update: Update, context: CallbackContext) -> None:
     # testing function
     from_id = update.message.from_user.id
     if not is_local_admin(from_id):
         return
-    print(referral(from_id))
-    print(referral_link(context, from_id))
+    message = update.message.text
+    for x in range(500):
+        context.bot.send_message(chat_id=from_id, 
+            text=message,
+            parse_mode=ParseMode.HTML)
 
 def diverter(update: Update, context: CallbackContext) -> None:
     """
@@ -575,6 +604,48 @@ def diverter(update: Update, context: CallbackContext) -> None:
                 reply_markup=reply_markup,
                 parse_mode=ParseMode.HTML)
         context.user_data["page"] -= 1
+    elif args[0] == "adminwho_forward":
+        calc_data = context.user_data.get("who_messages", None)
+        calc_page = context.user_data.get("who_page", None)
+        if not calc_data or calc_page is None:
+            context.bot.answer_callback_query(callback_query_id=query.id)
+            return
+        calc_page += 1
+        if calc_page >= len(calc_data):
+            context.bot.answer_callback_query(callback_query_id=query.id)
+            return
+        message_text = "".join(calc_data[calc_page])
+        keyboard = [[InlineKeyboardButton("⬅️", callback_data=f"adminwho_backward:{calc_page}"),
+                    InlineKeyboardButton(f"{calc_page+1}/{len(calc_data)}", callback_data=f"adminwho:0"),
+                    InlineKeyboardButton("➡️", callback_data=f"adminwho_forward:{calc_page}")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        context.bot.edit_message_text(chat_id=query.message.chat.id, 
+                message_id=query.message.message_id, 
+                text=message_text,
+                reply_markup=reply_markup,
+                parse_mode=ParseMode.HTML)
+        context.user_data["who_page"] += 1
+    elif args[0] == "adminwho_backward":
+        calc_data = context.user_data.get("who_messages", None)
+        calc_page = context.user_data.get("who_page", None)
+        if not calc_data or calc_page is None:
+            context.bot.answer_callback_query(callback_query_id=query.id)
+            return
+        calc_page -= 1
+        if calc_page < 0:
+            context.bot.answer_callback_query(callback_query_id=query.id)
+            return
+        message_text = "".join(calc_data[calc_page])
+        keyboard = [[InlineKeyboardButton("⬅️", callback_data=f"adminwho_backward:{calc_page}"),
+                    InlineKeyboardButton(f"{calc_page+1}/{len(calc_data)}", callback_data=f"admintop:0"),
+                    InlineKeyboardButton("➡️", callback_data=f"adminwho_forward:{calc_page}")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        context.bot.edit_message_text(chat_id=query.message.chat.id, 
+                message_id=query.message.message_id, 
+                text=message_text,
+                reply_markup=reply_markup,
+                parse_mode=ParseMode.HTML)
+        context.user_data["who_page"] -= 1
     else:
         pass
     context.bot.answer_callback_query(callback_query_id=query.id)
@@ -618,6 +689,54 @@ def user(update: Update, context: CallbackContext) -> None:
     update.message.reply_text(text=inspect.cleandoc(message), 
                         parse_mode=ParseMode.HTML,
                         reply_markup=reply_markup)
+
+def remove_job_if_exists(name, context):
+    """Remove job with given name. Returns whether job was removed."""
+    current_jobs = context.job_queue.get_jobs_by_name(name)
+    if not current_jobs:
+        return False
+    for job in current_jobs:
+        job.schedule_removal()
+    return True
+
+def start_notify(context):
+    job = context.job
+    message = job.context
+    for user in db.search(User.captcha == True):
+        if not data.notify: break
+        user_id = user['id']
+        context.bot.send_message(chat_id=user_id, 
+                    text=message,
+                    parse_mode=ParseMode.HTML)
+    data.notify = False
+
+def notify_command(update, context) -> None:
+    from_id = update.message.from_user.id
+    if not is_local_admin(from_id):
+        return
+    if not context.args:
+        update.message.reply_text("Please provide some text.")
+        return
+    if data.notify:
+        update.message.reply_text("Notify already running...")
+        return
+    data.notify = True
+    chat_id = update.message.chat_id
+    message = update.message.text_html
+    message_split = message.split()
+    # remove command, keep new lines.
+    message = message[len(message_split[0]):]
+    context.job_queue.run_once(start_notify, when=0, context=message, name=str(chat_id))
+
+def cancel_command(update, context) -> None:
+    from_id = update.message.from_user.id
+    if not is_local_admin(from_id):
+        return
+    if data.notify:
+        data.notify = False
+        update.message.reply_text("Cancelled notify.")
+    else:
+        update.message.reply_text("Notify not running.")
 
 def set_channel(update: Update, context: CallbackContext) -> None:
     user_id = update.message.from_user.id
@@ -707,7 +826,17 @@ def who_command(update: Update, context: CallbackContext) -> None:
         if not referral_data: continue
         messages.append(f"<code>{counter})</code> {link(referral_data['id'], html.escape(referral_data['first_name']))} <i>({referral_data['points']} invitations)</i> [<code>{referral_data['id']}</code>]\n")
         counter += 1
-    update.message.reply_text(''.join(messages), parse_mode=ParseMode.HTML)
+    calc_clean = list(slice_per(messages, 10))
+    context.user_data["who_messages"] = calc_clean
+    context.user_data["who_page"] = 0
+    keyboard = [[InlineKeyboardButton("⬅️", callback_data=f"adminwho_backward:{0}"),
+                InlineKeyboardButton(f"1/{len(calc_clean)}", callback_data=f"adminwho:0"),
+                InlineKeyboardButton("➡️", callback_data=f"adminwho_forward:{0}")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    update.message.reply_text(''.join(calc_clean[0]), 
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=reply_markup)
+    #update.message.reply_text(''.join(messages), parse_mode=ParseMode.HTML)
 
 def address(update: Update, context: CallbackContext) -> None:
     #user_id = check_user(update, context)
@@ -1031,8 +1160,13 @@ def main():
     """
     Start the bot and add the commands.
     """
+    token = config.get("main", "token")
+    q = mq.MessageQueue(all_burst_limit=20, all_time_limit_ms=1000)
+    # set connection pool size for bot 
+    request = Request(con_pool_size=8)
+    refbot = MQBot(token, request=request, mqueue=q)
     # Create the Updater and pass it your bot's token.
-    updater = Updater(config.get("main", "token"), user_sig_handler=release_db)
+    updater = Updater(bot=refbot, user_sig_handler=release_db)
 
     # Get the dispatcher to register handlers
     dispatcher = updater.dispatcher
@@ -1053,6 +1187,8 @@ def main():
     dispatcher.add_handler(CommandHandler(["address", "a"], address, Filters.chat_type.private))
     dispatcher.add_handler(CommandHandler(["reload"], reload_command, Filters.chat_type.private))
     dispatcher.add_handler(CommandHandler(["setchannel", "sc"], set_channel, Filters.chat_type.private))
+    dispatcher.add_handler(CommandHandler(["notify"], notify_command, Filters.chat_type.private))
+    dispatcher.add_handler(CommandHandler(["cancel"], cancel_command, Filters.chat_type.private))
     dispatcher.add_handler(CommandHandler(["test"], test))
 
     # Channel commands.
